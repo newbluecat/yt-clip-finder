@@ -13,32 +13,52 @@ from youtube_transcript_api import (
     YouTubeTranscriptApi,
 )
 
-from models import TranscriptResult, VideoMetadata, TranscriptChunk
+from models import TranscriptResult, VideoMetadata
 
 YT_DLP_OPTS: Final[dict[str, Any]] = {
     "quiet": True,
     "extract_flat": "in_playlist",
     "skip_download": True,
 }
-UPLOAD_DATE_LENGTH: Final[int] = 8
 
 
 def build_playlist_ytdlp_url(identifier: str) -> str:
-    """Convert a valid ID into a playlist url."""
+    """Convert a valid ID into a playlist URL.
+
+    Args:
+        identifier: The raw YouTube playlist ID.
+
+    Returns:
+        The full YouTube playlist URL.
+    """
     clean_id: str = identifier.strip()
     return f"https://www.youtube.com/playlist?list={clean_id}"
 
 
 def build_channel_ytdlp_url(handle: str) -> str:
-    """Convert a valid ID into a channel url."""
+    """Convert a valid handle into a channel URL.
+
+    Args:
+        handle: The creator's handle, with or without the '@' prefix.
+
+    Returns:
+        The full YouTube channel videos URL.
+    """
     clean_handle: str = handle.strip()
     if not clean_handle.startswith("@"):
         clean_handle = f"@{clean_handle}"
-    return f"https://www.youtube.com/@{clean_handle}/videos"
+    return f"https://www.youtube.com/{clean_handle}/videos"
 
 
 def fetch_records(url: str) -> list[VideoMetadata]:
-    """Scrapes video metadata from either a playlist or channel URL."""
+    """Scrape video metadata from either a playlist or channel URL.
+
+    Args:
+        url: The full YouTube playlist or channel URL to scrape.
+
+    Returns:
+        A list of parsed VideoMetadata tuples.
+    """
     records: list[VideoMetadata] = []
 
     try:
@@ -50,38 +70,57 @@ def fetch_records(url: str) -> list[VideoMetadata]:
     except yt_dlp.utils.DownloadError:
         return records
 
-    if not info:
+    if info is None:
         return records
 
-    entries: list[dict[str, Any]] = info.get("entries", [])
+    try:
+        entries: list[dict[str, Any]] = info["entries"]
+    except KeyError:
+        return records
+
     for entry in entries:
         parsed: VideoMetadata | None = _get_record(entry)
-        if parsed:
+        if parsed is not None:
             records.append(parsed)
 
     return records
 
 
-def _get_record(entry: dict[str, Any] | None) -> VideoMetadata | None:
-    """Extract a VideoMetadata tuple from an entry from a yt-dlp dictionary."""
-    if entry is None or not isinstance(entry, dict):
+def _get_record(entry: Any) -> VideoMetadata | None:
+    """Extract a VideoMetadata tuple from a raw yt-dlp entry dictionary.
+
+    Args:
+        entry: A raw dictionary representing a video entry from yt-dlp.
+
+    Returns:
+        A VideoMetadata tuple, or None if the entry is missing a video ID
+        or is malformed.
+    """
+    try:
+        video_id: str | None = entry.get("id")
+    except AttributeError:
+        # Fails immediately if entry is None or not a dict-like object
         return None
 
-    video_id: str | None = entry.get("id")
     if video_id is None:
         return None
 
-    raw_date: str | None = entry.get("upload_date")
     formatted_date: datetime.date | None = None
-    if raw_date and len(raw_date) == UPLOAD_DATE_LENGTH and raw_date.isdigit():
+    try:
+        raw_date: str = entry["upload_date"]
         formatted_date = datetime.date(
             int(raw_date[:4]),
             int(raw_date[4:6]),
             int(raw_date[6:8]),
         )
+    except KeyError, TypeError, ValueError, IndexError:
+        formatted_date = None
 
-    raw_duration: float | int | None = entry.get("duration")
-    duration: int | None = int(raw_duration) if raw_duration is not None else None
+    duration: int | None = None
+    try:
+        duration = int(entry["duration"])
+    except KeyError, TypeError, ValueError:
+        duration = None
 
     return VideoMetadata(
         video_id=video_id,
@@ -98,7 +137,16 @@ def fetch_transcripts(
     max_retries_per_video: int = 3,
     max_workers: int = 3,
 ) -> list[TranscriptResult]:
-    """Fetch transcripts for a batch of video IDs concurrently using threads."""
+    """Fetch transcripts for a batch of video IDs concurrently using threads.
+
+    Args:
+        video_ids: List of YouTube video IDs to transcribe.
+        max_retries_per_video: Maximum retry attempts per video on failure.
+        max_workers: Size of the thread pool executor.
+
+    Returns:
+        A list of TranscriptResult tuples containing fetch statuses.
+    """
     ytt_api: YouTubeTranscriptApi = YouTubeTranscriptApi()
     results: list[TranscriptResult] = []
 
@@ -128,7 +176,16 @@ def _get_transcript(
     ytt_api: YouTubeTranscriptApi,
     max_retries: int = 3,
 ) -> TranscriptResult:
-    """Fetch one transcript with exponentially increasing delays for rate limits."""
+    """Fetch one transcript with exponentially increasing delays for rate limits.
+
+    Args:
+        video_id: The target YouTube video ID.
+        ytt_api: An instance of YouTubeTranscriptApi.
+        max_retries: Number of retry attempts before returning a failure status.
+
+    Returns:
+        A TranscriptResult indicating success, permanent failure, or retryable error.
+    """
     for attempt in range(max_retries):
         try:
             time.sleep(random.uniform(0.3, 0.8))
@@ -142,7 +199,6 @@ def _get_transcript(
             )
 
         except (TranscriptsDisabled, NoTranscriptFound) as e:
-            # video has no transcripts or transcript disabled
             return TranscriptResult(
                 video_id=video_id,
                 transcript=None,
@@ -151,7 +207,6 @@ def _get_transcript(
             )
 
         except VideoUnavailable as e:
-            # video not found
             return TranscriptResult(
                 video_id=video_id,
                 transcript=None,
@@ -160,7 +215,6 @@ def _get_transcript(
             )
 
         except Exception as e:
-            # probably 429 rate limit
             if attempt == max_retries - 1:
                 return TranscriptResult(
                     video_id=video_id,
@@ -179,10 +233,19 @@ def _get_transcript(
         error="Aborted without execution",
     )
 
-def extract_transcript(transcript_result: TranscriptResult) -> FetchedTranscript:
-    """Extract the FetchedTranscript from TranscriptResult.
+
+def extract_transcript(
+    transcript_result: TranscriptResult,
+) -> FetchedTranscript | None:
+    """Extract the FetchedTranscript from a TranscriptResult.
+
+    Args:
+        transcript_result: The result object returned by the transcript fetcher.
+
+    Returns:
+        The underlying FetchedTranscript object, or None if it is missing.
     """
-
-
-def chunk_transcript() -> list[TranscriptChunk]:
-
+    try:
+        return transcript_result.transcript
+    except AttributeError:
+        return None
