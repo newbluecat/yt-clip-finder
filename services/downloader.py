@@ -13,7 +13,7 @@ from youtube_transcript_api import (
     YouTubeTranscriptApi,
 )
 
-from models import TranscriptResult, VideoMetadata
+from models import TranscriptResult, VideoMetadata, TranscriptChunk
 
 YT_DLP_OPTS: Final[dict[str, Any]] = {
     "quiet": True,
@@ -178,3 +178,11 @@ def _get_transcript(
         status="RETRYABLE",
         error="Aborted without execution",
     )
+
+def extract_transcript(transcript_result: TranscriptResult) -> FetchedTranscript:
+    """Extract the FetchedTranscript from TranscriptResult.
+    """
+
+
+def chunk_transcript() -> list[TranscriptChunk]:
+

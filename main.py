@@ -1,31 +1,7 @@
-import sys
-
-from PySide6.QtCore import QSize
-from PySide6.QtWidgets import QApplication, QMainWindow, QPushButton
-
-
-class MainWindow(QMainWindow):
-    def __init__(self):
-        super().__init__()
-
-        self.setWindowTitle("My App")
-
-        button = QPushButton("Press Me!")
-
-        self.setFixedSize(QSize(400, 300))
-
-        # Set the central widget of the Window.
-        self.setCentralWidget(button)
-
-
-def main():
-    app = QApplication(sys.argv)
-
-    window = MainWindow()
-    window.show()
-
-    app.exec()
-
+import services.downloader
 
 if __name__ == "__main__":
-    main()
+    url: str = services.downloader.build_playlist_ytdlp_url(
+        "PLrMS357ieiqS894xcyXj2wwG8H05Rutvo",
+    )
+    print(services.downloader.fetch_records(url))
