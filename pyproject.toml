@@ -16,4 +16,4 @@ select = ["ALL"]
 ignore = ["INP001", "D100", "CPY001", "S311", "BLE001"]
 
 [tool.ruff.lint.pydocstyle]
-convention = "google"
+convention = "pep257"

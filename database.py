@@ -96,7 +96,7 @@ def insert_video_record(
         )
 
         if transcript_text is not None:
-            # old transcript
+            # remove old transcript
             conn.execute(
                 "DELETE FROM transcripts_fts WHERE video_id = ?;",
                 (video_id,),
@@ -115,7 +115,7 @@ def search_transcripts(
     query: str,
     limit: int = 20,
 ) -> list[SearchResult]:
-    """Search transcripts using FTS5 MATCH, returning BM25 rank and highlighted snippets."""
+    """Search using FTS5 MATCH, returning BM25 rank and highlighted snippets."""
     clean_query: str = query.strip()
     if not clean_query:
         return []
@@ -137,16 +137,15 @@ def search_transcripts(
     cursor: sqlite3.Cursor = conn.execute(sql, (clean_query, limit))
     rows: list[sqlite3.Row] = cursor.fetchall()
 
-    results: list[SearchResult] = []
-    for row in rows:
-        results.append(
-            SearchResult(
-                video_id=str(row["video_id"]),
-                title=str(row["title"] or "Unknown Title"),
-                channel=str(row["channel"] or "Unknown Channel"),
-                snippet=str(row["snippet_text"]),
-                rank=float(row["rank"]),
-            ),
+    results: list[SearchResult] = [
+        SearchResult(
+            video_id=str(row["video_id"]),
+            title=str(row["title"] or "Unknown Title"),
+            channel=str(row["channel"] or "Unknown Channel"),
+            snippet=str(row["snippet_text"]),
+            rank=float(row["rank"]),
         )
+        for row in rows
+    ]
 
     return results
