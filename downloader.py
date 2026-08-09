@@ -13,6 +13,7 @@ from youtube_transcript_api import (
     YouTubeTranscriptApi,
 )
 
+import database
 from models import TranscriptChunk, TranscriptResult, VideoMetadata
 
 if TYPE_CHECKING:
@@ -25,21 +26,21 @@ YT_DLP_OPTS: Final[dict[str, Any]] = {
 }
 
 
-def build_playlist_ytdlp_url(identifier: str) -> str:
+def _build_playlist_ytdlp_url(identifier: str) -> str:
     """Convert a valid ID into a playlist URL."""
     clean_id: str = identifier.strip()
     return f"https://www.youtube.com/playlist?list={clean_id}"
 
 
-def build_channel_ytdlp_url(handle: str) -> str:
+def _build_channel_ytdlp_url(identifier: str) -> str:
     """Convert a valid handle into a channel URL."""
-    clean_handle: str = handle.strip()
+    clean_handle: str = identifier.strip()
     if not clean_handle.startswith("@"):
         clean_handle = f"@{clean_handle}"
     return f"https://www.youtube.com/{clean_handle}/videos"
 
 
-def fetch_records(url: str) -> list[VideoMetadata]:
+def _get_records(url: str) -> list[VideoMetadata]:
     """Scrape video metadata from either a playlist or channel URL."""
     records: list[VideoMetadata] = []
 
@@ -103,7 +104,7 @@ def _get_single_record(entry: dict[str, Any]) -> VideoMetadata | None:
     )
 
 
-def fetch_transcripts(
+def _get_transcripts(
     video_ids: list[str],
     max_retries_per_video: int = 3,
     max_workers: int = 3,
@@ -187,20 +188,87 @@ def _get_single_transcript(
     )
 
 
+def _chunk_transcript_sliding(
+    result: TranscriptResult,
+    window_seconds: float = 30.0,
+    overlap_seconds: float = 10.0,
+) -> list[TranscriptChunk]:
+    """Group caption lines using atomic time blocks to simplify overlap math."""
+    if result.transcript is None:
+        return []
+
+    raw_segments: list[dict[str, Any]] = result.transcript.to_raw_data()
+    if not raw_segments:
+        return []
+
+    blocks: list[list[dict[str, Any]]] = []
+    current_block: list[dict[str, Any]] = []
+    block_start: float = float(raw_segments[0].get("start", 0.0))
+
+    for seg in raw_segments:
+        seg_start: float = float(seg.get("start", 0.0))
+
+        if seg_start - block_start >= overlap_seconds:
+            if current_block:
+                blocks.append(current_block)
+            current_block = [seg]
+            block_start = seg_start
+        else:
+            current_block.append(seg)
+
+    if current_block:
+        blocks.append(current_block)
+
+    # using a stride of window_length - 1, we automatically
+    # get overlaps
+    blocks_per_window: int = int(window_seconds // overlap_seconds)
+    stride: int = blocks_per_window - 1
+
+    if stride <= 0:
+        stride = 1
+
+    chunks: list[TranscriptChunk] = []
+
+    for i in range(0, len(blocks), stride):
+        window_blocks: list[list[dict[str, Any]]] = blocks[i : i + blocks_per_window]
+
+        # at the end, if only one block left,
+        # adds the previous block to it to make it longer
+        if len(window_blocks) == 1 and i > 0:
+            window_blocks.insert(0, blocks[i - 1])
+
+        current_text: list[str] = []
+        start_time: float = float(window_blocks[0][0].get("start", 0.0))
+
+        for block in window_blocks:
+            for seg in block:
+                text: str = str(seg.get("text", "")).strip()
+                if text:
+                    current_text.append(text)
+
+        if current_text:
+            chunks.append(
+                TranscriptChunk(
+                    video_id=result.video_id,
+                    start_time=start_time,
+                    text=" ".join(current_text),
+                ),
+            )
+    return chunks
+
+
 def process_target(
     conn: sqlite3.Connection,
     source_type: str,
     target_id: str,
     batch_size: int = 50,
 ) -> None:
-    """Coordinate fetching transcripts and metadata, chunking, and DB insertion in batches."""
-    url: str
-    if source_type == "Playlist":
-        url = build_playlist_ytdlp_url(target_id)
-    else:
-        url = build_channel_ytdlp_url(target_id)
+    """Coordinate inserting transcript chunks from url in batches."""
+    url: str = (
+        _build_playlist_ytdlp_url(target_id) if source_type == "Playlist" else _build_channel_ytdlp_url(target_id)
+    )
 
-    records: list[VideoMetadata] = fetch_records(url)
+    records: list[VideoMetadata] = _get_records(url)
     if not records:
         return
 
@@ -208,7 +276,7 @@ def process_target(
         batch_videos: list[VideoMetadata] = records[i : i + batch_size]
         batch_video_ids: list[str] = [meta.video_id for meta in batch_videos]
 
-        batch_transcript_results: list[TranscriptResult] = fetch_transcripts(
+        batch_transcript_results: list[TranscriptResult] = _get_transcripts(
             batch_video_ids,
         )
 
@@ -220,7 +288,7 @@ def process_target(
 
             if result.status == "SUCCESS":
                 try:
-                    video_chunks: list[TranscriptChunk] = chunk_transcript_sliding(
+                    video_chunks: list[TranscriptChunk] = _chunk_transcript_sliding(
                         result,
                     )
                     batch_chunks.extend(video_chunks)
@@ -231,10 +299,10 @@ def process_target(
             if video_id not in batch_status_map:
                 batch_status_map[video_id] = "RETRYABLE"
 
-        _save_batch_to_db(
+        database.batch_insert_videos(
             conn=conn,
             metadata_batch=batch_videos,
-            batch_status_map=batch_status_map,
+            status_map=batch_status_map,
             chunks=batch_chunks,
         )
 

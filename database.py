@@ -1,5 +1,8 @@
 import sqlite3
-from typing import Final, NamedTuple
+from typing import TYPE_CHECKING, Final, NamedTuple
+
+if TYPE_CHECKING:
+    from models import TranscriptChunk, VideoMetadata
 
 DB_PATH: Final[str] = "transcripts.db"
 
@@ -43,30 +46,44 @@ def init_db(conn: sqlite3.Connection) -> None:
             """
             CREATE VIRTUAL TABLE IF NOT EXISTS transcripts_fts USING fts5(
                 video_id UNINDEXED,
-                title,
-                content,
+                start_time UNINDEXED,
+                text,
                 tokenize='porter unicode61'
             );
             """,
         )
 
 
-def insert_video_record(
+def batch_insert_videos(
     conn: sqlite3.Connection,
-    video_id: str,
-    title: str | None,
-    channel: str | None,
-    channel_id: str | None,
-    upload_date: str | None,
-    duration_seconds: int | None,
-    transcript_text: str | None,
-    status: str = "SUCCESS",
+    metadata_batch: list[VideoMetadata],
+    status_map: dict[str, str],
+    chunks: list[TranscriptChunk],
 ) -> None:
-    """Insert or replace a video record and its FTS5 search index entry."""
+    """Insert or replace video metadata and transcript chunks in one transaction."""
+    video_rows: list[tuple[str, str | None, str | None, str | None, str | None, int | None, str]] = []
+
+    for meta in metadata_batch:
+        date_str: str | None = meta.upload_date.isoformat() if meta.upload_date is not None else None
+        status: str = status_map.get(meta.video_id, "RETRYABLE")
+        video_rows.append(
+            (
+                meta.video_id,
+                meta.title,
+                meta.channel,
+                meta.channel_id,
+                date_str,
+                meta.duration_seconds,
+                status,
+            ),
+        )
+
+    chunk_rows: list[tuple[str, float, str]] = [(c.video_id, c.start_time, c.text) for c in chunks]
+
     with conn:
-        conn.execute(
+        conn.executemany(
             """
-            INSERT INTO videos (
+            INSERT OR REPLACE INTO videos (
                 video_id,
                 title,
                 channel,
@@ -75,45 +92,36 @@ def insert_video_record(
                 duration_seconds,
                 status
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(video_id) DO UPDATE SET
-                title = excluded.title,
-                channel = excluded.channel,
-                channel_id = excluded.channel_id,
-                upload_date = excluded.upload_date,
-                duration_seconds = excluded.duration_seconds,
-                status = excluded.status;
+            VALUES (?, ?, ?, ?, ?, ?, ?);
             """,
-            (
-                video_id,
-                title,
-                channel,
-                channel_id,
-                upload_date,
-                duration_seconds,
-                status,
-            ),
+            video_rows,
         )
 
-        if transcript_text is not None:
-            # remove old transcript
-            conn.execute(
+        if chunk_rows:
+            # remove any older chunks for these videos before inserting new ones
+            video_ids: list[tuple[str]] = [(meta.video_id,) for meta in metadata_batch]
+            conn.executemany(
                 "DELETE FROM transcripts_fts WHERE video_id = ?;",
-                (video_id,),
+                video_ids,
             )
-            conn.execute(
+
+            conn.executemany(
                 """
-                INSERT INTO transcripts_fts (video_id, title, content)
+                INSERT INTO transcripts_fts (
+                    video_id,
+                    start_time,
+                    text
+                )
                 VALUES (?, ?, ?);
                 """,
-                (video_id, title or "", transcript_text),
+                chunk_rows,
             )
 
 
 def search_transcripts(
     conn: sqlite3.Connection,
     query: str,
-    limit: int = 20,
+    limit: int = 100,
 ) -> list[SearchResult]:
     """Search using FTS5 MATCH, returning BM25 rank and highlighted snippets."""
     clean_query: str = query.strip()

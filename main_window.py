@@ -25,7 +25,7 @@ MAX_QUERY_LENGTH: Final[int] = 50
 class MainWindow(QMainWindow):
     """Main window interface matching the layout sketch."""
 
-    def __init__(self) -> None:
+    def __init__(self) -> None:  # noqa: PLR0915
         super().__init__()
         self.setWindowTitle("YouTube Transcript Search")
         self.resize(650, 700)
@@ -159,7 +159,7 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("Fetching metadata... %p%")
 
-        # Clear existing cards
+        # Clear existing search results
         self.clear_results()
 
     def on_abort_clicked(self) -> None:
