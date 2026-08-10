@@ -2,6 +2,7 @@ import concurrent.futures
 import datetime
 import random
 import time
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Final
 
 import yt_dlp
@@ -14,7 +15,7 @@ from youtube_transcript_api import (
 )
 
 import database
-from models import TranscriptChunk, TranscriptResult, VideoMetadata
+from models import TranscriptResult, TranscriptSnippet, VideoMetadata
 
 if TYPE_CHECKING:
     import sqlite3
@@ -46,10 +47,7 @@ def _get_records(url: str) -> list[VideoMetadata]:
 
     try:
         with yt_dlp.YoutubeDL(YT_DLP_OPTS) as ydl:
-            info: dict[str, Any] | None = ydl.extract_info(
-                url=url,
-                download=False,
-            )
+            info: dict[str, Any] | None = ydl.extract_info(url, download=False)
     except yt_dlp.utils.DownloadError:
         return records
 
@@ -113,9 +111,7 @@ def _get_transcripts(
     ytt_api: YouTubeTranscriptApi = YouTubeTranscriptApi()
     results: list[TranscriptResult] = []
 
-    with concurrent.futures.ThreadPoolExecutor(
-        max_workers=max_workers,
-    ) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures: list[concurrent.futures.Future[TranscriptResult]] = [
             executor.submit(
                 _get_single_transcript,
@@ -192,7 +188,7 @@ def _chunk_transcript_sliding(
     result: TranscriptResult,
     window_seconds: float = 30.0,
     overlap_seconds: float = 10.0,
-) -> list[TranscriptChunk]:
+) -> list[TranscriptSnippet]:
     """Group caption lines using atomic time blocks to simplify overlap math."""
     if result.transcript is None:
         return []
@@ -227,7 +223,7 @@ def _chunk_transcript_sliding(
     if stride <= 0:
         stride = 1
 
-    chunks: list[TranscriptChunk] = []
+    chunks: list[TranscriptSnippet] = []
 
     for i in range(0, len(blocks), stride):
         window_blocks: list[list[dict[str, Any]]] = blocks[i : i + blocks_per_window]
@@ -248,7 +244,7 @@ def _chunk_transcript_sliding(
 
         if current_text:
             chunks.append(
-                TranscriptChunk(
+                TranscriptSnippet(
                     video_id=result.video_id,
                     start_time=start_time,
                     text=" ".join(current_text),
@@ -262,6 +258,7 @@ def process_target(
     source_type: str,
     target_id: str,
     batch_size: int = 50,
+    progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> None:
     """Coordinate inserting transcript chunks from url in batches."""
     url: str = (
@@ -276,21 +273,17 @@ def process_target(
         batch_videos: list[VideoMetadata] = records[i : i + batch_size]
         batch_video_ids: list[str] = [meta.video_id for meta in batch_videos]
 
-        batch_transcript_results: list[TranscriptResult] = _get_transcripts(
-            batch_video_ids,
-        )
+        batch_transcript_results: list[TranscriptResult] = _get_transcripts(batch_video_ids)
 
         batch_status_map: dict[str, str] = {}
-        batch_chunks: list[TranscriptChunk] = []
+        batch_chunks: list[TranscriptSnippet] = []
 
         for result in batch_transcript_results:
             batch_status_map[result.video_id] = result.status
 
             if result.status == "SUCCESS":
                 try:
-                    video_chunks: list[TranscriptChunk] = _chunk_transcript_sliding(
-                        result,
-                    )
+                    video_chunks: list[TranscriptSnippet] = _chunk_transcript_sliding(result)
                     batch_chunks.extend(video_chunks)
                 except Exception:
                     batch_status_map[result.video_id] = "RETRYABLE"
@@ -305,5 +298,13 @@ def process_target(
             status_map=batch_status_map,
             chunks=batch_chunks,
         )
+
+        if progress_callback is not None:
+            current_count: int = min(i + batch_size, len(records))
+            progress_callback(
+                current_count,
+                len(records),
+                f"Processed {current_count}/{len(records)} videos...",
+            )
 
     return

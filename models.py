@@ -26,9 +26,20 @@ class TranscriptResult(NamedTuple):
     error: str | None
 
 
-class TranscriptChunk(NamedTuple):
-    """Contains a restructured chunk of the TranscriptResult."""
+class TranscriptSnippet(NamedTuple):
+    """Contains a restructured snippet of the TranscriptResult."""
 
     video_id: str
     start_time: float
     text: str
+
+
+class SearchResult(NamedTuple):
+    """Results of a search of the sqlite3 database."""
+
+    video_id: str
+    title: str
+    channel: str
+    start_time: float
+    snippet: str
+    rank: float

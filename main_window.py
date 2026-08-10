@@ -1,31 +1,41 @@
 import sys
-from typing import Any, Final
+from typing import TYPE_CHECKING, Final
 
-from PySide6.QtCore import QDate, Qt
+from PySide6.QtCore import QDate
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QComboBox,
     QDateEdit,
-    QFrame,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QMainWindow,
     QProgressBar,
     QPushButton,
     QRadioButton,
-    QScrollArea,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
+
+import database
+from database import SearchResult
+from search_worker import SearchWorker
+
+if TYPE_CHECKING:
+    import sqlite3
 
 MAX_QUERY_LENGTH: Final[int] = 50
 
 
 class MainWindow(QMainWindow):
-    """Main window interface matching the layout sketch."""
+    """Main window interface."""
 
     def __init__(self) -> None:  # noqa: PLR0915
+        """Initialize the main UI."""
         super().__init__()
         self.setWindowTitle("YouTube Transcript Search")
         self.resize(650, 700)
@@ -35,16 +45,17 @@ class MainWindow(QMainWindow):
         main_layout: QVBoxLayout = QVBoxLayout(central_widget)
 
         # search results
-        self.scroll_area: QScrollArea = QScrollArea()
-        self.scroll_area.setWidgetResizable(True)
-        self.scroll_area.setFrameShape(QFrame.Shape.StyledPanel)
+        self.results_table: QTableWidget = QTableWidget()
+        self.results_table.setColumnCount(4)
+        self.results_table.setHorizontalHeaderLabels(["Title", "Channel", "Time (s)", "Snippet"])
+        self.results_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.results_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.results_table.verticalHeader().setVisible(False)
+        self.results_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        self.results_table.horizontalHeader().setStretchLastSection(True)
+        self.results_table.setShowGrid(False)
 
-        self.results_container: QWidget = QWidget()
-        self.results_layout: QVBoxLayout = QVBoxLayout(self.results_container)
-        self.results_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
-        self.scroll_area.setWidget(self.results_container)
-
-        main_layout.addWidget(self.scroll_area, stretch=1)
+        main_layout.addWidget(self.results_table, stretch=1)
 
         # source selection and id input
         options_layout: QVBoxLayout = QVBoxLayout()
@@ -153,14 +164,88 @@ class MainWindow(QMainWindow):
         self.date_to.setEnabled(checked)
 
     def on_search_clicked(self) -> None:
-        """Trigger search state in UI (mock handler)."""
+        """Trigger search state and start the background worker."""
+        source_type: str = self.source_combo.currentText()
+        target_id: str = self.id_input.text().strip()
+        query_text: str = self.query_input.text().strip()
+
+        # we catch falsy strings here since an empty string is invalid for a search
+        if not target_id:
+            return
+
         self.search_button.setEnabled(False)
         self.abort_button.setEnabled(True)
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("Fetching metadata... %p%")
 
-        # Clear existing search results
-        self.clear_results()
+        self.worker: SearchWorker = SearchWorker(
+            db_path="transcripts.db",
+            source_type=source_type,
+            target_id=target_id,
+            query_text=query_text,
+        )
+        self.worker.finished.connect(self.on_search_finished)
+        self.worker.error.connect(self.on_search_error)
+        self.worker.progress.connect(self.on_progress_update)
+        self.worker.start()
+
+    def on_search_finished(self) -> None:
+        """Handle worker completion, query database, and populate table."""
+        self.search_button.setEnabled(True)
+        self.abort_button.setEnabled(False)
+        self.progress_bar.setValue(100)
+
+        query_text: str = self.query_input.text().strip()
+        if not query_text:
+            self.progress_bar.setFormat("No query provided.")
+            return
+
+        results: list[SearchResult] = []
+
+        try:
+            conn: sqlite3.Connection | None = database.get_connection("transcripts.db")
+            if conn is not None:
+                results = database.search_transcripts(conn=conn, query=query_text)
+        except Exception as e:
+            self.progress_bar.setFormat(f"Error querying database: {e}")
+            return
+        finally:
+            if conn is not None:
+                conn.close()
+
+        result_count: int = len(results)
+
+        if result_count == 0:
+            self.progress_bar.setFormat("No results found.")
+            return
+
+        self.progress_bar.setFormat(f"Found {result_count} results.")
+        self.results_table.setRowCount(result_count)
+
+        for row, res in enumerate(results):
+            self.results_table.setItem(row, 0, QTableWidgetItem(res.title))
+            self.results_table.setItem(row, 1, QTableWidgetItem(res.channel))
+            self.results_table.setItem(row, 2, QTableWidgetItem(f"{res.start_time:.1f}"))
+            self.results_table.setItem(row, 3, QTableWidgetItem(res.snippet))
+
+        self.results_table.resizeColumnsToContents()
+
+        # Restrict column widths to prevent massive titles from breaking the layout
+        self.results_table.setColumnWidth(0, min(self.results_table.columnWidth(0), 200))
+        self.results_table.setColumnWidth(1, min(self.results_table.columnWidth(1), 150))
+
+    def on_search_error(self, err_msg: str) -> None:
+        """Handle worker errors."""
+        self.search_button.setEnabled(True)
+        self.abort_button.setEnabled(False)
+        self.progress_bar.setFormat(f"Error: {err_msg}")
+
+    def on_progress_update(self, current: int, total: int, msg: str) -> None:
+        """Update the progress bar from the worker thread."""
+        if total > 0:
+            percent: int = int((current / total) * 100)
+            self.progress_bar.setValue(percent)
+        self.progress_bar.setFormat(msg)
 
     def on_abort_clicked(self) -> None:
         """Trigger abort state in UI (mock handler)."""
@@ -169,12 +254,8 @@ class MainWindow(QMainWindow):
         self.progress_bar.setFormat("Aborted")
 
     def clear_results(self) -> None:
-        """Remove all child widgets from the results container."""
-        while self.results_layout.count() > 0:
-            item: Any = self.results_layout.takeAt(0)
-            widget: QWidget | None = item.widget()
-            if widget is not None:
-                widget.deleteLater()
+        """Clear all rows from the results table."""
+        self.results_table.setRowCount(0)
 
 
 if __name__ == "__main__":

@@ -1,20 +1,9 @@
 import sqlite3
-from typing import TYPE_CHECKING, Final, NamedTuple
+from typing import Final
 
-if TYPE_CHECKING:
-    from models import TranscriptChunk, VideoMetadata
+from models import SearchResult, TranscriptSnippet, VideoMetadata
 
 DB_PATH: Final[str] = "transcripts.db"
-
-
-class SearchResult(NamedTuple):
-    """Results of a search of the sqlite3 database."""
-
-    video_id: str
-    title: str
-    channel: str
-    snippet: str
-    rank: float
 
 
 def get_connection(db_path: str = DB_PATH) -> sqlite3.Connection:
@@ -58,7 +47,7 @@ def batch_insert_videos(
     conn: sqlite3.Connection,
     metadata_batch: list[VideoMetadata],
     status_map: dict[str, str],
-    chunks: list[TranscriptChunk],
+    chunks: list[TranscriptSnippet],
 ) -> None:
     """Insert or replace video metadata and transcript chunks in one transaction."""
     video_rows: list[tuple[str, str | None, str | None, str | None, str | None, int | None, str]] = []
@@ -125,15 +114,18 @@ def search_transcripts(
 ) -> list[SearchResult]:
     """Search using FTS5 MATCH, returning BM25 rank and highlighted snippets."""
     clean_query: str = query.strip()
+
+    # Check for empty string (falsy) because an empty query is invalid for FTS5
     if not clean_query:
         return []
 
     sql: str = """
         SELECT
             fts.video_id,
+            fts.start_time,
             v.title,
             v.channel,
-            snippet(transcripts_fts, 2, '<b>', '</b>', '...', 15) AS snippet_text,
+            snippet(transcripts_fts, 2, '', '', '...', 15) AS snippet_text,
             bm25(transcripts_fts) AS rank
         FROM transcripts_fts AS fts
         JOIN videos AS v ON v.video_id = fts.video_id
@@ -148,8 +140,9 @@ def search_transcripts(
     results: list[SearchResult] = [
         SearchResult(
             video_id=str(row["video_id"]),
-            title=str(row["title"] or "Unknown Title"),
-            channel=str(row["channel"] or "Unknown Channel"),
+            title=str(row["title"]) if row["title"] is not None else "Unknown Title",
+            channel=str(row["channel"]) if row["channel"] is not None else "Unknown Channel",
+            start_time=float(row["start_time"]),
             snippet=str(row["snippet_text"]),
             rank=float(row["rank"]),
         )
