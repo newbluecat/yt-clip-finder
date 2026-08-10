@@ -4,16 +4,16 @@ from PySide6.QtCore import QThread, Signal
 
 import database
 import downloader
-from models import SearchResult
 
 if TYPE_CHECKING:
     import sqlite3
+
+    from models import SearchResult
 
 
 class SearchWorker(QThread):
     """Worker thread to run backend processing and database queries."""
 
-    # Emit the list of SearchResult objects back to the main thread
     results_found: Signal = Signal(list)
     error: Signal = Signal(str)
     progress: Signal = Signal(int, int, str)
@@ -39,7 +39,6 @@ class SearchWorker(QThread):
             conn = database.get_connection(self.db_path)
 
             if conn is not None:
-                # 1. Download and insert new transcripts
                 downloader.process_target(
                     conn=conn,
                     source_type=self.source_type,
@@ -56,5 +55,4 @@ class SearchWorker(QThread):
         finally:
             if conn is not None:
                 conn.close()
-            # 3. Emit the results list
             self.results_found.emit(results)

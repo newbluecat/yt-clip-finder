@@ -21,12 +21,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-import database
-from database import SearchResult
 from search_worker import SearchWorker
 
 if TYPE_CHECKING:
-    import sqlite3
+    from database import SearchResult
 
 MAX_QUERY_LENGTH: Final[int] = 50
 
@@ -44,7 +42,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central_widget)
         main_layout: QVBoxLayout = QVBoxLayout(central_widget)
 
-        # search results
+        # search results table
         self.results_table: QTableWidget = QTableWidget()
         self.results_table.setColumnCount(4)
         self.results_table.setHorizontalHeaderLabels(["Title", "Channel", "Time (s)", "Snippet"])
@@ -57,7 +55,7 @@ class MainWindow(QMainWindow):
 
         main_layout.addWidget(self.results_table, stretch=1)
 
-        # source selection and id input
+        # source selection dropdown
         options_layout: QVBoxLayout = QVBoxLayout()
 
         source_id_row: QHBoxLayout = QHBoxLayout()
@@ -71,6 +69,7 @@ class MainWindow(QMainWindow):
             ],
         )
 
+        # id input text box
         id_label: QLabel = QLabel("ID:")
         self.id_input: QLineEdit = QLineEdit()
         self.source_combo.currentTextChanged.connect(self.on_source_changed)
@@ -83,7 +82,7 @@ class MainWindow(QMainWindow):
         source_id_row.addWidget(self.id_input, stretch=1)
         options_layout.addLayout(source_id_row)
 
-        # upload date filter
+        # upload date filter with selection
         date_row: QHBoxLayout = QHBoxLayout()
         date_label: QLabel = QLabel("Upload Date:")
 
@@ -184,34 +183,20 @@ class MainWindow(QMainWindow):
             target_id=target_id,
             query_text=query_text,
         )
-        self.worker.finished.connect(self.on_search_finished)
+        self.worker.results_found.connect(self.on_search_finished)
         self.worker.error.connect(self.on_search_error)
         self.worker.progress.connect(self.on_progress_update)
         self.worker.start()
 
-    def on_search_finished(self) -> None:
+    def on_search_finished(self, results: list[SearchResult]) -> None:
         """Handle worker completion, query database, and populate table."""
         self.search_button.setEnabled(True)
         self.abort_button.setEnabled(False)
         self.progress_bar.setValue(100)
 
-        query_text: str = self.query_input.text().strip()
-        if not query_text:
+        if not self.query_input.text().strip():
             self.progress_bar.setFormat("No query provided.")
             return
-
-        results: list[SearchResult] = []
-
-        try:
-            conn: sqlite3.Connection | None = database.get_connection("transcripts.db")
-            if conn is not None:
-                results = database.search_transcripts(conn=conn, query=query_text)
-        except Exception as e:
-            self.progress_bar.setFormat(f"Error querying database: {e}")
-            return
-        finally:
-            if conn is not None:
-                conn.close()
 
         result_count: int = len(results)
 
@@ -230,7 +215,7 @@ class MainWindow(QMainWindow):
 
         self.results_table.resizeColumnsToContents()
 
-        # Restrict column widths to prevent massive titles from breaking the layout
+        # restrict column widths to prevent massive titles or channel breaking layouts
         self.results_table.setColumnWidth(0, min(self.results_table.columnWidth(0), 200))
         self.results_table.setColumnWidth(1, min(self.results_table.columnWidth(1), 150))
 

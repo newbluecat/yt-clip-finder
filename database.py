@@ -115,7 +115,7 @@ def search_transcripts(
     """Search using FTS5 MATCH, returning BM25 rank and highlighted snippets."""
     clean_query: str = query.strip()
 
-    # Check for empty string (falsy) because an empty query is invalid for FTS5
+    # check for empty string because an empty query is invalid for FTS5
     if not clean_query:
         return []
 

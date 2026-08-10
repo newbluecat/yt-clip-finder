@@ -2,7 +2,6 @@ import concurrent.futures
 import datetime
 import random
 import time
-from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Final
 
 import yt_dlp
@@ -19,6 +18,7 @@ from models import TranscriptResult, TranscriptSnippet, VideoMetadata
 
 if TYPE_CHECKING:
     import sqlite3
+    from collections.abc import Callable
 
 YT_DLP_OPTS: Final[dict[str, Any]] = {
     "quiet": True,
@@ -269,7 +269,9 @@ def process_target(
     if not records:
         return
 
-    for i in range(0, len(records), batch_size):
+    total_records: int = len(records)
+
+    for i in range(0, total_records, batch_size):
         batch_videos: list[VideoMetadata] = records[i : i + batch_size]
         batch_video_ids: list[str] = [meta.video_id for meta in batch_videos]
 
@@ -285,7 +287,9 @@ def process_target(
                 try:
                     video_chunks: list[TranscriptSnippet] = _chunk_transcript_sliding(result)
                     batch_chunks.extend(video_chunks)
-                except Exception:
+                except Exception as e:
+                    # mostly for debugging
+                    print(f"Error chunking transcript for {result.video_id}: {e}")
                     batch_status_map[result.video_id] = "RETRYABLE"
 
         for video_id in batch_video_ids:
@@ -300,11 +304,11 @@ def process_target(
         )
 
         if progress_callback is not None:
-            current_count: int = min(i + batch_size, len(records))
+            current_count: int = min(i + batch_size, total_records)
             progress_callback(
                 current_count,
-                len(records),
-                f"Processed {current_count}/{len(records)} videos...",
+                total_records,
+                f"Processed {current_count}/{total_records} videos...",
             )
 
     return
