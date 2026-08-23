@@ -1,6 +1,6 @@
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import QThread, Signal
+from PySide6.QtCore import QObject, QThread, Signal
 
 import database
 import downloader
@@ -18,9 +18,16 @@ class SearchWorker(QThread):
     error: Signal = Signal(str)
     progress: Signal = Signal(int, int, str)
 
-    def __init__(self, db_path: str, source_type: str, target_id: str, query_text: str) -> None:
+    def __init__(
+        self,
+        db_path: str,
+        source_type: str,
+        target_id: str,
+        query_text: str,
+        parent: QObject | None = None,
+    ) -> None:
         """Initialize the search work with db and basic query info."""
-        super().__init__()
+        super().__init__(parent)
         self.db_path: str = db_path
         self.source_type: str = source_type
         self.target_id: str = target_id
@@ -39,6 +46,8 @@ class SearchWorker(QThread):
             conn = database.get_connection(self.db_path)
 
             if conn is not None:
+                database.init_db(conn)
+
                 downloader.process_target(
                     conn=conn,
                     source_type=self.source_type,

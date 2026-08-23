@@ -1,10 +1,8 @@
-import sys
-from typing import TYPE_CHECKING, Final
+from typing import Final
 
-from PySide6.QtCore import QDate
+from PySide6.QtCore import QDate, Qt
 from PySide6.QtWidgets import (
     QAbstractItemView,
-    QApplication,
     QComboBox,
     QDateEdit,
     QHBoxLayout,
@@ -21,10 +19,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from database import SearchResult
 from search_worker import SearchWorker
-
-if TYPE_CHECKING:
-    from database import SearchResult
 
 MAX_QUERY_LENGTH: Final[int] = 50
 
@@ -130,9 +126,9 @@ class MainWindow(QMainWindow):
         # progress bar
         self.progress_bar: QProgressBar = QProgressBar()
         self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(100)
+        self.progress_bar.setValue(0)
         self.progress_bar.setTextVisible(True)
-        self.progress_bar.setFormat("Ready")
+        self.progress_bar.setFormat("")
         main_layout.addWidget(self.progress_bar)
 
         # search and abort buttons
@@ -174,14 +170,17 @@ class MainWindow(QMainWindow):
 
         self.search_button.setEnabled(False)
         self.abort_button.setEnabled(True)
+
+        self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
-        self.progress_bar.setFormat("Fetching metadata... %p%")
+        self.progress_bar.setFormat("Fetching video metadata...")
 
         self.worker: SearchWorker = SearchWorker(
             db_path="transcripts.db",
             source_type=source_type,
             target_id=target_id,
             query_text=query_text,
+            parent=self,
         )
         self.worker.results_found.connect(self.on_search_finished)
         self.worker.error.connect(self.on_search_error)
@@ -189,35 +188,40 @@ class MainWindow(QMainWindow):
         self.worker.start()
 
     def on_search_finished(self, results: list[SearchResult]) -> None:
-        """Handle worker completion, query database, and populate table."""
-        self.search_button.setEnabled(True)
-        self.abort_button.setEnabled(False)
-        self.progress_bar.setValue(100)
-
-        if not self.query_input.text().strip():
-            self.progress_bar.setFormat("No query provided.")
-            return
-
+        """Handle worker completion and table population."""
         result_count: int = len(results)
 
         if result_count == 0:
             self.progress_bar.setFormat("No results found.")
             return
 
-        self.progress_bar.setFormat(f"Found {result_count} results.")
+        self.progress_bar.setFormat(f"Found {result_count} results!")
+        self.results_table.clearContents()
         self.results_table.setRowCount(result_count)
 
         for row, res in enumerate(results):
             self.results_table.setItem(row, 0, QTableWidgetItem(res.title))
             self.results_table.setItem(row, 1, QTableWidgetItem(res.channel))
             self.results_table.setItem(row, 2, QTableWidgetItem(f"{res.start_time:.1f}"))
-            self.results_table.setItem(row, 3, QTableWidgetItem(res.snippet))
+
+            snippet_label: QLabel = QLabel(res.snippet)
+            snippet_label.setTextFormat(Qt.TextFormat.RichText)
+            snippet_label.setContentsMargins(4, 2, 4, 2)  # padding
+
+            self.results_table.setCellWidget(row, 3, snippet_label)
 
         self.results_table.resizeColumnsToContents()
 
         # restrict column widths to prevent massive titles or channel breaking layouts
         self.results_table.setColumnWidth(0, min(self.results_table.columnWidth(0), 200))
         self.results_table.setColumnWidth(1, min(self.results_table.columnWidth(1), 150))
+
+        self.search_button.setEnabled(True)
+        self.abort_button.setEnabled(False)
+        self.progress_bar.setValue(100)
+
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(100)
 
     def on_search_error(self, err_msg: str) -> None:
         """Handle worker errors."""
@@ -227,10 +231,10 @@ class MainWindow(QMainWindow):
 
     def on_progress_update(self, current: int, total: int, msg: str) -> None:
         """Update the progress bar from the worker thread."""
-        if total > 0:
-            percent: int = int((current / total) * 100)
-            self.progress_bar.setValue(percent)
-        self.progress_bar.setFormat(msg)
+        if total > 0 and self.progress_bar.maximum() != total:
+            self.progress_bar.setRange(0, total)
+        self.progress_bar.setValue(current)
+        self.progress_bar.setFormat(f"{msg} %p%")
 
     def on_abort_clicked(self) -> None:
         """Trigger abort state in UI (mock handler)."""
@@ -241,10 +245,3 @@ class MainWindow(QMainWindow):
     def clear_results(self) -> None:
         """Clear all rows from the results table."""
         self.results_table.setRowCount(0)
-
-
-if __name__ == "__main__":
-    app: QApplication = QApplication(sys.argv)
-    window: MainWindow = MainWindow()
-    window.show()
-    sys.exit(app.exec())

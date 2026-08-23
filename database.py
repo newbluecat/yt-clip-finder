@@ -125,7 +125,7 @@ def search_transcripts(
             fts.start_time,
             v.title,
             v.channel,
-            snippet(transcripts_fts, 2, '', '', '...', 15) AS snippet_text,
+            snippet(transcripts_fts, 2, '<b>', '</b>', '...', 15) AS snippet_text,
             bm25(transcripts_fts) AS rank
         FROM transcripts_fts AS fts
         JOIN videos AS v ON v.video_id = fts.video_id
@@ -140,8 +140,8 @@ def search_transcripts(
     results: list[SearchResult] = [
         SearchResult(
             video_id=str(row["video_id"]),
-            title=str(row["title"]) if row["title"] is not None else "Unknown Title",
-            channel=str(row["channel"]) if row["channel"] is not None else "Unknown Channel",
+            title=str(row["title"] or "Unknown Title"),
+            channel=str(row["channel"] or "Unknown Channel"),
             start_time=float(row["start_time"]),
             snippet=str(row["snippet_text"]),
             rank=float(row["rank"]),

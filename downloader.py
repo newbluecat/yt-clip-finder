@@ -27,13 +27,13 @@ YT_DLP_OPTS: Final[dict[str, Any]] = {
 }
 
 
-def _build_playlist_ytdlp_url(identifier: str) -> str:
+def _build_playlist_url(identifier: str) -> str:
     """Convert a valid ID into a playlist URL."""
     clean_id: str = identifier.strip()
     return f"https://www.youtube.com/playlist?list={clean_id}"
 
 
-def _build_channel_ytdlp_url(identifier: str) -> str:
+def _build_channel_url(identifier: str) -> str:
     """Convert a valid handle into a channel URL."""
     clean_handle: str = identifier.strip()
     if not clean_handle.startswith("@"):
@@ -104,6 +104,7 @@ def _get_single_record(entry: dict[str, Any]) -> VideoMetadata | None:
 
 def _get_transcripts(
     video_ids: list[str],
+    on_callback: Callable[[], None] | None = None,
     max_retries_per_video: int = 3,
     max_workers: int = 3,
 ) -> list[TranscriptResult]:
@@ -127,6 +128,9 @@ def _get_transcripts(
             if result is not None:
                 results.append(result)
 
+            if on_callback is not None:
+                on_callback()
+
     return results
 
 
@@ -138,7 +142,8 @@ def _get_single_transcript(
     """Fetch one transcript with exponentially increasing delays for rate limits."""
     for attempt in range(max_retries):
         try:
-            time.sleep(random.uniform(0.3, 0.8))
+            if attempt > 0:
+                time.sleep(random.uniform(0.3, 0.8))
 
             transcript: FetchedTranscript = ytt_api.fetch(video_id)
             return TranscriptResult(
@@ -253,6 +258,31 @@ def _chunk_transcript_sliding(
     return chunks
 
 
+def _prepare_batch_data(
+    results: list[TranscriptResult],
+    video_ids: list[str],
+) -> tuple[dict[str, str], list[TranscriptSnippet]]:
+    """Transform raw transcript results into database-ready structures."""
+    status_map: dict[str, str] = {}
+    chunks: list[TranscriptSnippet] = []
+
+    for result in results:
+        status_map[result.video_id] = result.status
+
+        if result.status == "SUCCESS":
+            try:
+                video_chunks: list[TranscriptSnippet] = _chunk_transcript_sliding(result)
+                chunks.extend(video_chunks)
+            except Exception:
+                status_map[result.video_id] = "RETRYABLE"
+
+    for video_id in video_ids:
+        if video_id not in status_map:
+            status_map[video_id] = "RETRYABLE"
+
+    return status_map, chunks
+
+
 def process_target(
     conn: sqlite3.Connection,
     source_type: str,
@@ -261,40 +291,35 @@ def process_target(
     progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> None:
     """Coordinate inserting transcript chunks from url in batches."""
-    url: str = (
-        _build_playlist_ytdlp_url(target_id) if source_type == "Playlist" else _build_channel_ytdlp_url(target_id)
-    )
+    url: str = _build_playlist_url(target_id) if source_type == "Playlist" else _build_channel_url(target_id)
 
     records: list[VideoMetadata] = _get_records(url)
     if not records:
         return
-
     total_records: int = len(records)
 
+    fetched_transcript_count = 0
     for i in range(0, total_records, batch_size):
         batch_videos: list[VideoMetadata] = records[i : i + batch_size]
         batch_video_ids: list[str] = [meta.video_id for meta in batch_videos]
 
-        batch_transcript_results: list[TranscriptResult] = _get_transcripts(batch_video_ids)
+        def _on_transcript_done() -> None:
+            nonlocal fetched_transcript_count
+            fetched_transcript_count += 1
 
-        batch_status_map: dict[str, str] = {}
-        batch_chunks: list[TranscriptSnippet] = []
+            if progress_callback is not None:
+                progress_callback(
+                    fetched_transcript_count,
+                    total_records,
+                    f"Fetching transcripts... {fetched_transcript_count}/{total_records}",
+                )
 
-        for result in batch_transcript_results:
-            batch_status_map[result.video_id] = result.status
+        batch_transcript_results: list[TranscriptResult] = _get_transcripts(batch_video_ids, _on_transcript_done)
 
-            if result.status == "SUCCESS":
-                try:
-                    video_chunks: list[TranscriptSnippet] = _chunk_transcript_sliding(result)
-                    batch_chunks.extend(video_chunks)
-                except Exception as e:
-                    # mostly for debugging
-                    print(f"Error chunking transcript for {result.video_id}: {e}")
-                    batch_status_map[result.video_id] = "RETRYABLE"
-
-        for video_id in batch_video_ids:
-            if video_id not in batch_status_map:
-                batch_status_map[video_id] = "RETRYABLE"
+        batch_status_map, batch_chunks = _prepare_batch_data(
+            results=batch_transcript_results,
+            video_ids=batch_video_ids,
+        )
 
         database.batch_insert_videos(
             conn=conn,
@@ -302,13 +327,5 @@ def process_target(
             status_map=batch_status_map,
             chunks=batch_chunks,
         )
-
-        if progress_callback is not None:
-            current_count: int = min(i + batch_size, total_records)
-            progress_callback(
-                current_count,
-                total_records,
-                f"Processed {current_count}/{total_records} videos...",
-            )
 
     return
