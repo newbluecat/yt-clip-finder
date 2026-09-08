@@ -1,3 +1,4 @@
+import datetime
 from typing import TYPE_CHECKING
 
 from PySide6.QtCore import QObject, QThread, Signal
@@ -24,6 +25,9 @@ class SearchWorker(QThread):
         source_type: str,
         target_id: str,
         query_text: str,
+        start_date: datetime.date | None,
+        end_date: datetime.date | None,
+        limit: int = 100,
         parent: QObject | None = None,
     ) -> None:
         """Initialize the search work with db and basic query info."""
@@ -32,15 +36,13 @@ class SearchWorker(QThread):
         self.source_type: str = source_type
         self.target_id: str = target_id
         self.query_text: str = query_text
+        self.start_date: datetime.date | None = start_date
+        self.end_date: datetime.date | None = end_date
+        self.limit: int = limit
 
     def run(self) -> None:
         """Execute the target processing and search in the background."""
-
-        def _progress_cb(current: int, total: int, msg: str) -> None:
-            self.progress.emit(current, total, msg)
-
         conn: sqlite3.Connection | None = None
-        results: list[SearchResult] = []
 
         try:
             conn = database.get_connection(self.db_path)
@@ -52,16 +54,24 @@ class SearchWorker(QThread):
                     conn=conn,
                     source_type=self.source_type,
                     target_id=self.target_id,
-                    progress_callback=_progress_cb,
+                    start_date=self.start_date,
+                    end_date=self.end_date,
+                    progress_callback=self.progress.emit,
                 )
 
                 if self.query_text:
                     self.progress.emit(100, 100, "Querying database...")
-                    results = database.search_transcripts(conn=conn, query=self.query_text)
+                    results: list[SearchResult] = database.search_transcripts(
+                        conn=conn,
+                        query=self.query_text,
+                        start_date=self.start_date,
+                        end_date=self.end_date,
+                        limit=self.limit,
+                    )
+                    self.results_found.emit(results)
 
         except Exception as e:
-            self.error.emit(str(e))
+            self.error.emit(f"Error:{e!s}")
         finally:
             if conn is not None:
                 conn.close()
-            self.results_found.emit(results)

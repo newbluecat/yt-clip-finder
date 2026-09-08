@@ -1,3 +1,6 @@
+import datetime
+import html
+import urllib.parse
 from typing import Final
 
 from PySide6.QtCore import QDate, Qt
@@ -23,6 +26,21 @@ from database import SearchResult
 from search_worker import SearchWorker
 
 MAX_QUERY_LENGTH: Final[int] = 50
+QPROGRESS_ERROR_STYLESHEET = """
+    QProgressBar {
+        border: 1px solid #bcbcbc;
+        border-radius: 4px;
+        background-color: #ffcccc; /* Light red background */
+        text-align: center;
+        color: #FFFFFF; /* Text color */
+        font-weight: bold;
+    }
+
+    QProgressBar::chunk {
+        background-color: #cc0000; /* Darker red for progress fill */
+        border-radius: 3px; /* Slightly smaller than container to look clean */
+}
+"""
 
 
 class MainWindow(QMainWindow):
@@ -82,7 +100,7 @@ class MainWindow(QMainWindow):
         date_row: QHBoxLayout = QHBoxLayout()
         date_label: QLabel = QLabel("Upload Date:")
 
-        self.date_any_radio: QRadioButton = QRadioButton("Any")
+        self.date_any_radio: QRadioButton = QRadioButton("All Time")
         self.date_any_radio.setChecked(True)
 
         self.date_custom_radio: QRadioButton = QRadioButton("Custom Range:")
@@ -93,6 +111,7 @@ class MainWindow(QMainWindow):
         self.date_from.setEnabled(False)
 
         date_separator_label: QLabel = QLabel("-")
+
         self.date_to: QDateEdit = QDateEdit()
         self.date_to.setDisplayFormat("yyyy-MM-dd")
         self.date_to.setDate(QDate.currentDate())
@@ -149,9 +168,9 @@ class MainWindow(QMainWindow):
     def on_source_changed(self, text: str) -> None:
         """Update the Target ID placeholder based on the selected source."""
         if text == "Playlist":
-            self.id_input.setPlaceholderText("Playlist ID")
+            self.id_input.setPlaceholderText("Example: PLKDZ1ig0uz-U")
         else:
-            self.id_input.setPlaceholderText("@creator")
+            self.id_input.setPlaceholderText("Example: @YouTube")
 
     def on_date_mode_toggled(self, checked: bool) -> None:
         """Enable or disable custom date pickers based on radio selection."""
@@ -162,11 +181,42 @@ class MainWindow(QMainWindow):
         """Trigger search state and start the background worker."""
         source_type: str = self.source_combo.currentText()
         target_id: str = self.id_input.text().strip()
-        query_text: str = self.query_input.text().strip()
+        query: str = self.query_input.text().strip()
 
-        # we catch falsy strings here since an empty string is invalid for a search
+        # we catch falsy strings here since an empty string or id is invalid for a search
         if not target_id:
+            self.on_error("ERROR: Playlist ID cannot be empty.")
             return
+
+        if not query:
+            self.on_error("ERROR: Query cannot be empty.")
+            return
+
+        start_date: datetime.date | None = None
+        end_date: datetime.date | None = None
+
+        if self.date_custom_radio.isChecked():
+            # start_date = self.date_from.date().toPython()
+            # end_date = self.date_to.date().toPython()
+            q_start = self.date_from.date()
+            q_end = self.date_to.date()
+            start_date = datetime.date(q_start.year(), q_start.month(), q_start.day())
+            end_date = datetime.date(q_end.year(), q_end.month(), q_end.day())
+
+        self.worker: SearchWorker = SearchWorker(
+            db_path="transcripts.db",
+            source_type=source_type,
+            target_id=target_id,
+            query_text=query,
+            start_date=start_date,
+            end_date=end_date,
+            parent=self,
+        )
+
+        self.worker.results_found.connect(self.on_search_finished)
+        self.worker.error.connect(self.on_error)
+        self.worker.progress.connect(self.on_progress_update)
+        self.worker.start()
 
         self.search_button.setEnabled(False)
         self.abort_button.setEnabled(True)
@@ -175,21 +225,15 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("Fetching video metadata...")
 
-        self.worker: SearchWorker = SearchWorker(
-            db_path="transcripts.db",
-            source_type=source_type,
-            target_id=target_id,
-            query_text=query_text,
-            parent=self,
-        )
-        self.worker.results_found.connect(self.on_search_finished)
-        self.worker.error.connect(self.on_search_error)
-        self.worker.progress.connect(self.on_progress_update)
-        self.worker.start()
-
-    def on_search_finished(self, results: list[SearchResult]) -> None:
+    def on_search_finished(self, search_results: list[SearchResult]) -> None:
         """Handle worker completion and table population."""
-        result_count: int = len(results)
+        result_count: int = len(search_results)
+
+        self.search_button.setEnabled(True)
+        self.abort_button.setEnabled(False)
+        self.progress_bar.setStyleSheet("")
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(100)
 
         if result_count == 0:
             self.progress_bar.setFormat("No results found.")
@@ -199,15 +243,23 @@ class MainWindow(QMainWindow):
         self.results_table.clearContents()
         self.results_table.setRowCount(result_count)
 
-        for row, res in enumerate(results):
-            self.results_table.setItem(row, 0, QTableWidgetItem(res.title))
-            self.results_table.setItem(row, 1, QTableWidgetItem(res.channel))
-            self.results_table.setItem(row, 2, QTableWidgetItem(f"{res.start_time:.1f}"))
+        for row, sr in enumerate(search_results):
+            self.results_table.setItem(row, 0, QTableWidgetItem(sr.title))
+            self.results_table.setItem(row, 1, QTableWidgetItem(sr.channel))
 
-            snippet_label: QLabel = QLabel(res.snippet)
+            minutes, seconds = divmod(sr.start_time, 60)
+            self.results_table.setItem(row, 2, QTableWidgetItem(f"{int(minutes):02d}:{int(seconds):02d}"))
+
+            safe_video_id: str = urllib.parse.quote(sr.video_id)
+            youtube_url: str = f"https://youtu.be/{safe_video_id}?t={int(sr.start_time)}"
+
+            safe_snippet: str = html.escape(sr.snippet)
+            safe_snippet = safe_snippet.replace("[[[", "<b>").replace("]]]", "</b>")
+            linked_snippet: str = f'<a href="{youtube_url}" style="color: white;">{safe_snippet}</a>'
+            snippet_label: QLabel = QLabel(linked_snippet)
             snippet_label.setTextFormat(Qt.TextFormat.RichText)
+            snippet_label.setOpenExternalLinks(True)
             snippet_label.setContentsMargins(4, 2, 4, 2)  # padding
-
             self.results_table.setCellWidget(row, 3, snippet_label)
 
         self.results_table.resizeColumnsToContents()
@@ -216,31 +268,31 @@ class MainWindow(QMainWindow):
         self.results_table.setColumnWidth(0, min(self.results_table.columnWidth(0), 200))
         self.results_table.setColumnWidth(1, min(self.results_table.columnWidth(1), 150))
 
-        self.search_button.setEnabled(True)
-        self.abort_button.setEnabled(False)
-        self.progress_bar.setValue(100)
-
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(100)
-
-    def on_search_error(self, err_msg: str) -> None:
+    def on_error(self, err_msg: str) -> None:
         """Handle worker errors."""
         self.search_button.setEnabled(True)
         self.abort_button.setEnabled(False)
-        self.progress_bar.setFormat(f"Error: {err_msg}")
+        self.progress_bar.setStyleSheet(QPROGRESS_ERROR_STYLESHEET)
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(100)
+        self.progress_bar.setFormat(err_msg)
 
     def on_progress_update(self, current: int, total: int, msg: str) -> None:
         """Update the progress bar from the worker thread."""
+        self.progress_bar.setStyleSheet("")
         if total > 0 and self.progress_bar.maximum() != total:
             self.progress_bar.setRange(0, total)
         self.progress_bar.setValue(current)
-        self.progress_bar.setFormat(f"{msg} %p%")
+        self.progress_bar.setFormat(msg)
 
     def on_abort_clicked(self) -> None:
         """Trigger abort state in UI (mock handler)."""
-        self.abort_button.setEnabled(False)
         self.search_button.setEnabled(True)
-        self.progress_bar.setFormat("Aborted")
+        self.abort_button.setEnabled(False)
+        self.progress_bar.setStyleSheet("")
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(100)
+        self.progress_bar.setFormat("Search aborted.")
 
     def clear_results(self) -> None:
         """Clear all rows from the results table."""

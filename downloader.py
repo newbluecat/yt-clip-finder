@@ -24,6 +24,7 @@ YT_DLP_OPTS: Final[dict[str, Any]] = {
     "quiet": True,
     "extract_flat": "in_playlist",
     "skip_download": True,
+    "playlistend": 10000,
 }
 
 
@@ -42,14 +43,12 @@ def _build_channel_url(identifier: str) -> str:
 
 
 def _get_records(url: str) -> list[VideoMetadata]:
-    """Scrape video metadata from either a playlist or channel URL."""
+    """Scrape video metadata from URL with a single yt-dlp request."""
     records: list[VideoMetadata] = []
 
-    try:
-        with yt_dlp.YoutubeDL(YT_DLP_OPTS) as ydl:
-            info: dict[str, Any] | None = ydl.extract_info(url, download=False)
-    except yt_dlp.utils.DownloadError:
-        return records
+    # if playlist doesn't exist, let process_target handle it
+    with yt_dlp.YoutubeDL(YT_DLP_OPTS) as ydl:
+        info: dict[str, Any] | None = ydl.extract_info(url, download=False)
 
     if info is None:
         return records
@@ -68,7 +67,7 @@ def _get_records(url: str) -> list[VideoMetadata]:
 
 
 def _get_single_record(entry: dict[str, Any]) -> VideoMetadata | None:
-    """Extract a VideoMetadata tuple from a raw yt-dlp entry dictionary."""
+    """Extract a VideoMetadata tuple from dict of yt-dlp entries."""
     try:
         video_id: str | None = entry.get("id")
     except AttributeError:
@@ -150,32 +149,28 @@ def _get_single_transcript(
                 video_id=video_id,
                 transcript=transcript,
                 status="SUCCESS",
-                error=None,
             )
 
-        except (TranscriptsDisabled, NoTranscriptFound) as e:
-            return TranscriptResult(
-                video_id=video_id,
-                transcript=None,
-                status="NO TRANSCRIPT",
-                error=str(e),
-            )
-
-        except VideoUnavailable as e:
+        except VideoUnavailable, TranscriptsDisabled:
             return TranscriptResult(
                 video_id=video_id,
                 transcript=None,
                 status="UNAVAILABLE",
-                error=str(e),
             )
 
-        except Exception as e:
+        except NoTranscriptFound:
+            return TranscriptResult(
+                video_id=video_id,
+                transcript=None,
+                status="RETRYABLE",
+            )
+
+        except Exception:
             if attempt == max_retries - 1:
                 return TranscriptResult(
                     video_id=video_id,
                     transcript=None,
                     status="RETRYABLE",
-                    error=f"ERROR: Failed after {max_retries} attempt(s): {e}",
                 )
 
             sleep_time: float = (2**attempt) + random.uniform(0.5, 1.5)
@@ -185,7 +180,6 @@ def _get_single_transcript(
         video_id=video_id,
         transcript=None,
         status="RETRYABLE",
-        error="Aborted without execution",
     )
 
 
@@ -212,8 +206,8 @@ def _chunk_transcript_sliding(
         if seg_start - block_start >= overlap_seconds:
             if current_block:
                 blocks.append(current_block)
-            current_block = [seg]
-            block_start = seg_start
+            current_block: list[dict[str, Any]] = [seg]
+            block_start: float = seg_start
         else:
             current_block.append(seg)
 
@@ -283,25 +277,72 @@ def _prepare_batch_data(
     return status_map, chunks
 
 
+def _filter_metadata(
+    conn: sqlite3.Connection,
+    metadata: list[VideoMetadata],
+    start_date: datetime.date | None,
+    end_date: datetime.date | None,
+) -> tuple[list[VideoMetadata], int, int]:
+    """Filter metadata by date and database existence, returning missing videos and counts."""
+    filtered_metadata: list[VideoMetadata] = []
+    for meta in metadata:
+        if start_date is not None and meta.upload_date is not None and meta.upload_date < start_date:
+            continue
+        if end_date is not None and meta.upload_date is not None and meta.upload_date > end_date:
+            continue
+        filtered_metadata.append(meta)
+
+    if not filtered_metadata:
+        return [], 0, len(filtered_metadata)
+
+    filtered_ids: list[str] = [meta.video_id for meta in filtered_metadata]
+    existing_ids: set[str] = database.get_existing_video_ids(conn, filtered_ids)
+
+    missing_metadata: list[VideoMetadata] = [vid for vid in filtered_metadata if vid.video_id not in existing_ids]
+
+    total_count: int = len(filtered_metadata)
+    skipped_count: int = total_count - len(missing_metadata)
+
+    return missing_metadata, total_count, skipped_count
+
+
 def process_target(
     conn: sqlite3.Connection,
     source_type: str,
     target_id: str,
+    start_date: datetime.date | None,
+    end_date: datetime.date | None,
     batch_size: int = 50,
     progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> None:
     """Coordinate inserting transcript chunks from url in batches."""
     url: str = _build_playlist_url(target_id) if source_type == "Playlist" else _build_channel_url(target_id)
 
-    records: list[VideoMetadata] = _get_records(url)
-    if not records:
+    metadata: list[VideoMetadata] = _get_records(url)
+    if not metadata:
+        if progress_callback is not None:
+            progress_callback(0, 0, f"{source_type} has no videos!")
         return
-    total_records: int = len(records)
 
-    fetched_transcript_count = 0
-    for i in range(0, total_records, batch_size):
-        batch_videos: list[VideoMetadata] = records[i : i + batch_size]
-        batch_video_ids: list[str] = [meta.video_id for meta in batch_videos]
+    missing_metadata, total_count, skipped_count = _filter_metadata(conn, metadata, start_date, end_date)
+
+    # if target has no videos within the specified dates
+    if total_count == 0:
+        if progress_callback is not None:
+            progress_callback(100, 100, f"{source_type} has no videos within the specified dates!")
+        return
+
+    # if all videos of target are already processed
+    missing_count: int = len(missing_metadata)
+    if missing_count == 0:
+        if progress_callback is not None:
+            progress_callback(100, 100, "All videos are already processed!")
+        return
+
+    fetched_transcript_count: int = 0
+    for i in range(0, missing_count, batch_size):
+        batch_videos: list[VideoMetadata] = missing_metadata[i : i + batch_size]
+        missing_ids: list[str] = [vid.video_id for vid in batch_videos]
 
         def _on_transcript_done() -> None:
             nonlocal fetched_transcript_count
@@ -310,15 +351,15 @@ def process_target(
             if progress_callback is not None:
                 progress_callback(
                     fetched_transcript_count,
-                    total_records,
-                    f"Fetching transcripts... {fetched_transcript_count}/{total_records}",
+                    missing_count,
+                    f"Fetching transcripts... {fetched_transcript_count}/{missing_count} (Skipped: {skipped_count})",
                 )
 
-        batch_transcript_results: list[TranscriptResult] = _get_transcripts(batch_video_ids, _on_transcript_done)
+        batch_transcript_results: list[TranscriptResult] = _get_transcripts(missing_ids, _on_transcript_done)
 
         batch_status_map, batch_chunks = _prepare_batch_data(
             results=batch_transcript_results,
-            video_ids=batch_video_ids,
+            video_ids=missing_ids,
         )
 
         database.batch_insert_videos(

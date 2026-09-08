@@ -1,3 +1,4 @@
+import datetime
 import sqlite3
 from typing import Final
 
@@ -111,30 +112,47 @@ def search_transcripts(
     conn: sqlite3.Connection,
     query: str,
     limit: int = 100,
+    start_date: datetime.date | None = None,
+    end_date: datetime.date | None = None,
 ) -> list[SearchResult]:
     """Search using FTS5 MATCH, returning BM25 rank and highlighted snippets."""
     clean_query: str = query.strip()
 
-    # check for empty string because an empty query is invalid for FTS5
+    # since empty queries are invalid for FTS5
     if not clean_query:
         return []
 
-    sql: str = """
+    # "[[[" and "]]]" are characters to enable escaping html tags later
+    sql_list: list[str] = [
+        """
         SELECT
             fts.video_id,
             fts.start_time,
             v.title,
             v.channel,
-            snippet(transcripts_fts, 2, '<b>', '</b>', '...', 15) AS snippet_text,
+            snippet(transcripts_fts, 2, '[[[', ']]]', '...', 15) AS snippet_text,
             bm25(transcripts_fts) AS rank
         FROM transcripts_fts AS fts
         JOIN videos AS v ON v.video_id = fts.video_id
         WHERE transcripts_fts MATCH ?
-        ORDER BY rank
-        LIMIT ?;
-    """
+        """,
+    ]
 
-    cursor: sqlite3.Cursor = conn.execute(sql, (clean_query, limit))
+    params: list[str | int] = [query]
+
+    if start_date is not None:
+        sql_list.append("AND v.upload_date >= ?")
+        params.append(start_date.isoformat())
+
+    if end_date is not None:
+        sql_list.append("AND v.upload_date <= ?")
+        params.append(end_date.isoformat())
+
+    sql_list.append("ORDER by rank LIMIT ?;")
+    params.append(limit)
+
+    sql: str = " ".join(sql_list)
+    cursor: sqlite3.Cursor = conn.execute(sql, tuple(params))
     rows: list[sqlite3.Row] = cursor.fetchall()
 
     results: list[SearchResult] = [
@@ -150,3 +168,21 @@ def search_transcripts(
     ]
 
     return results
+
+
+def get_existing_video_ids(conn: sqlite3.Connection, video_ids: list[str]) -> set[str]:
+    """Return a set of video IDs that are already successfully stored in the database."""
+    if not video_ids:
+        return set()
+
+    # need one ? for each video_id
+    placeholders: str = ",".join("?" for _ in video_ids)
+
+    sql: str = f"""
+        SELECT video_id
+        FROM videos
+        WHERE status = 'SUCCESS' AND video_id IN ({placeholders});
+    """
+
+    cursor: sqlite3.Cursor = conn.execute(sql, video_ids)
+    return {str(row["video_id"]) for row in cursor.fetchall()}

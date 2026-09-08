@@ -23,7 +23,6 @@ class TranscriptResult(NamedTuple):
     video_id: str
     transcript: FetchedTranscript | None
     status: str
-    error: str | None
 
 
 class TranscriptSnippet(NamedTuple):
