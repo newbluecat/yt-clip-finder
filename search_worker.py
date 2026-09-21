@@ -1,4 +1,4 @@
-import datetime
+import re
 from typing import TYPE_CHECKING
 
 from PySide6.QtCore import QObject, QThread, Signal
@@ -9,7 +9,7 @@ import downloader
 if TYPE_CHECKING:
     import sqlite3
 
-    from models import SearchResult
+    from models import SearchParams, SearchResult
 
 
 class SearchWorker(QThread):
@@ -22,23 +22,18 @@ class SearchWorker(QThread):
     def __init__(
         self,
         db_path: str,
-        source_type: str,
-        target_id: str,
-        query_text: str,
-        start_date: datetime.date | None,
-        end_date: datetime.date | None,
-        limit: int = 100,
+        search: SearchParams,
         parent: QObject | None = None,
     ) -> None:
         """Initialize the search work with db and basic query info."""
         super().__init__(parent)
         self.db_path: str = db_path
-        self.source_type: str = source_type
-        self.target_id: str = target_id
-        self.query_text: str = query_text
-        self.start_date: datetime.date | None = start_date
-        self.end_date: datetime.date | None = end_date
-        self.limit: int = limit
+        self.search: SearchParams = search
+        self._is_cancelled: bool = False
+
+    def cancel(self) -> None:
+        """Set is_cancelled to True for cancelling the worker."""
+        self._is_cancelled = True
 
     def run(self) -> None:
         """Execute the target processing and search in the background."""
@@ -52,26 +47,44 @@ class SearchWorker(QThread):
 
                 downloader.process_target(
                     conn=conn,
-                    source_type=self.source_type,
-                    target_id=self.target_id,
-                    start_date=self.start_date,
-                    end_date=self.end_date,
+                    search_params=self.search,
                     progress_callback=self.progress.emit,
+                    is_cancelled=lambda: self._is_cancelled,
                 )
 
-                if self.query_text:
+                if self._is_cancelled:
+                    return
+
+                if self.search.query:
                     self.progress.emit(100, 100, "Querying database...")
                     results: list[SearchResult] = database.search_transcripts(
                         conn=conn,
-                        query=self.query_text,
-                        start_date=self.start_date,
-                        end_date=self.end_date,
-                        limit=self.limit,
+                        query=self.search.query,
+                        start_date=self.search.start_date,
+                        end_date=self.search.end_date,
+                        limit=self.search.limit,
                     )
                     self.results_found.emit(results)
 
         except Exception as e:
-            self.error.emit(f"Error:{e!s}")
+            raw_msg: str = str(e)
+
+            if "400" in raw_msg:
+                parsed_msg: str = (
+                    f"Invalid {self.search.source_type} ID: Please make sure that the ID is spelled correctly."
+                )
+            elif "404" in raw_msg:
+                parsed_msg = f"{self.search.source_type} not found. It may be private or deleted."
+            elif "not exist" in raw_msg or "unavailable" in raw_msg:
+                parsed_msg = f"{self.search.source_type} is unavailable or does not exist."
+            else:
+                # fallback: strip ANSI codes and print the raw string
+                ansi_escape = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+                parsed_msg = ansi_escape.sub("", raw_msg)
+                if parsed_msg.startswith("ERROR:"):
+                    parsed_msg = parsed_msg.replace("ERROR:", "", 1).strip()
+
+            self.error.emit(parsed_msg)
         finally:
             if conn is not None:
                 conn.close()

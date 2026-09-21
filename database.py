@@ -1,8 +1,10 @@
-import datetime
 import sqlite3
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
 from models import SearchResult, TranscriptSnippet, VideoMetadata
+
+if TYPE_CHECKING:
+    import datetime
 
 DB_PATH: Final[str] = "transcripts.db"
 
@@ -87,14 +89,14 @@ def batch_insert_videos(
             video_rows,
         )
 
-        if chunk_rows:
-            # remove any older chunks for these videos before inserting new ones
-            video_ids: list[tuple[str]] = [(meta.video_id,) for meta in metadata_batch]
-            conn.executemany(
-                "DELETE FROM transcripts_fts WHERE video_id = ?;",
-                video_ids,
-            )
+        # remove any older chunks for these videos before inserting new ones
+        video_ids: list[tuple[str]] = [(meta.video_id,) for meta in metadata_batch]
+        conn.executemany(
+            "DELETE FROM transcripts_fts WHERE video_id = ?;",
+            video_ids,
+        )
 
+        if chunk_rows:
             conn.executemany(
                 """
                 INSERT INTO transcripts_fts (

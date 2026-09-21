@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import concurrent.futures
 import datetime
 import random
@@ -14,7 +16,7 @@ from youtube_transcript_api import (
 )
 
 import database
-from models import TranscriptResult, TranscriptSnippet, VideoMetadata
+from models import SearchParams, TranscriptResult, TranscriptSnippet, VideoMetadata
 
 if TYPE_CHECKING:
     import sqlite3
@@ -104,6 +106,7 @@ def _get_single_record(entry: dict[str, Any]) -> VideoMetadata | None:
 def _get_transcripts(
     video_ids: list[str],
     on_callback: Callable[[], None] | None = None,
+    is_cancelled: Callable[[], bool] | None = None,
     max_retries_per_video: int = 3,
     max_workers: int = 3,
 ) -> list[TranscriptResult]:
@@ -123,6 +126,11 @@ def _get_transcripts(
         ]
 
         for future in concurrent.futures.as_completed(futures):
+            if is_cancelled is not None and is_cancelled():
+                for f in futures:
+                    f.cancel()
+                break
+
             result: TranscriptResult | None = future.result()
             if result is not None:
                 results.append(result)
@@ -183,19 +191,11 @@ def _get_single_transcript(
     )
 
 
-def _chunk_transcript_sliding(
-    result: TranscriptResult,
-    window_seconds: float = 30.0,
-    overlap_seconds: float = 10.0,
-) -> list[TranscriptSnippet]:
-    """Group caption lines using atomic time blocks to simplify overlap math."""
-    if result.transcript is None:
-        return []
-
-    raw_segments: list[dict[str, Any]] = result.transcript.to_raw_data()
-    if not raw_segments:
-        return []
-
+def _build_atomic_blocks(
+    raw_segments: list[dict[str, Any]],
+    overlap_seconds: float,
+) -> list[list[dict[str, Any]]]:
+    """Group raw segments into discrete atomic time blocks."""
     blocks: list[list[dict[str, Any]]] = []
     current_block: list[dict[str, Any]] = []
     block_start: float = float(raw_segments[0].get("start", 0.0))
@@ -206,22 +206,26 @@ def _chunk_transcript_sliding(
         if seg_start - block_start >= overlap_seconds:
             if current_block:
                 blocks.append(current_block)
-            current_block: list[dict[str, Any]] = [seg]
-            block_start: float = seg_start
+            current_block = [seg]
+            block_start = seg_start
         else:
             current_block.append(seg)
 
     if current_block:
         blocks.append(current_block)
 
-    # using a stride of window_length - 1, we automatically
-    # get overlaps
+    return blocks
+
+
+def _build_sliding_chunks(
+    blocks: list[list[dict[str, Any]]],
+    video_id: str,
+    window_seconds: float,
+    overlap_seconds: float,
+) -> list[TranscriptSnippet]:
+    """Slide a window over atomic blocks to create overlapping text chunks."""
     blocks_per_window: int = int(window_seconds // overlap_seconds)
-    stride: int = blocks_per_window - 1
-
-    if stride <= 0:
-        stride = 1
-
+    stride: int = max(1, blocks_per_window - 1)
     chunks: list[TranscriptSnippet] = []
 
     for i in range(0, len(blocks), stride):
@@ -244,12 +248,36 @@ def _chunk_transcript_sliding(
         if current_text:
             chunks.append(
                 TranscriptSnippet(
-                    video_id=result.video_id,
+                    video_id=video_id,
                     start_time=start_time,
                     text=" ".join(current_text),
                 ),
             )
+
     return chunks
+
+
+def _chunk_transcript_sliding(
+    result: TranscriptResult,
+    window_seconds: float = 30.0,
+    overlap_seconds: float = 10.0,
+) -> list[TranscriptSnippet]:
+    """Group caption lines using atomic time blocks to simplify overlap math."""
+    if result.transcript is None:
+        return []
+
+    raw_segments: list[dict[str, Any]] = result.transcript.to_raw_data()
+    if not raw_segments:
+        return []
+
+    blocks: list[list[dict[str, Any]]] = _build_atomic_blocks(raw_segments, overlap_seconds)
+
+    return _build_sliding_chunks(
+        blocks=blocks,
+        video_id=result.video_id,
+        window_seconds=window_seconds,
+        overlap_seconds=overlap_seconds,
+    )
 
 
 def _prepare_batch_data(
@@ -306,47 +334,33 @@ def _filter_metadata(
     return missing_metadata, total_count, skipped_count
 
 
-def process_target(
+def _process_batches(
     conn: sqlite3.Connection,
-    source_type: str,
-    target_id: str,
-    start_date: datetime.date | None,
-    end_date: datetime.date | None,
-    batch_size: int = 50,
+    missing_metadata: list[VideoMetadata],
+    batch_size: int,
+    skipped_count: int,
     progress_callback: Callable[[int, int, str], None] | None = None,
+    is_cancelled: Callable[[], bool] | None = None,
 ) -> None:
-    """Coordinate inserting transcript chunks from url in batches."""
-    url: str = _build_playlist_url(target_id) if source_type == "Playlist" else _build_channel_url(target_id)
-
-    metadata: list[VideoMetadata] = _get_records(url)
-    if not metadata:
-        if progress_callback is not None:
-            progress_callback(0, 0, f"{source_type} has no videos!")
-        return
-
-    missing_metadata, total_count, skipped_count = _filter_metadata(conn, metadata, start_date, end_date)
-
-    # if target has no videos within the specified dates
-    if total_count == 0:
-        if progress_callback is not None:
-            progress_callback(100, 100, f"{source_type} has no videos within the specified dates!")
-        return
-
-    # if all videos of target are already processed
+    """Iterate through missing metadata to fetch and save transcripts in batches."""
     missing_count: int = len(missing_metadata)
-    if missing_count == 0:
-        if progress_callback is not None:
-            progress_callback(100, 100, "All videos are already processed!")
-        return
-
     fetched_transcript_count: int = 0
+
     for i in range(0, missing_count, batch_size):
+        if is_cancelled is not None and is_cancelled():
+            if progress_callback is not None:
+                progress_callback(fetched_transcript_count, missing_count, "Search aborted")
+            return
+
         batch_videos: list[VideoMetadata] = missing_metadata[i : i + batch_size]
         missing_ids: list[str] = [vid.video_id for vid in batch_videos]
 
         def _on_transcript_done() -> None:
             nonlocal fetched_transcript_count
             fetched_transcript_count += 1
+
+            if is_cancelled is not None and is_cancelled():
+                return
 
             if progress_callback is not None:
                 progress_callback(
@@ -355,8 +369,14 @@ def process_target(
                     f"Fetching transcripts... {fetched_transcript_count}/{missing_count} (Skipped: {skipped_count})",
                 )
 
-        batch_transcript_results: list[TranscriptResult] = _get_transcripts(missing_ids, _on_transcript_done)
+        batch_transcript_results: list[TranscriptResult] = _get_transcripts(
+            video_ids=missing_ids,
+            on_callback=_on_transcript_done,
+            is_cancelled=is_cancelled,
+        )
 
+        batch_status_map: dict[str, str]
+        batch_chunks: list[TranscriptSnippet]
         batch_status_map, batch_chunks = _prepare_batch_data(
             results=batch_transcript_results,
             video_ids=missing_ids,
@@ -369,4 +389,54 @@ def process_target(
             chunks=batch_chunks,
         )
 
-    return
+        if is_cancelled is not None and is_cancelled():
+            if progress_callback is not None:
+                progress_callback(fetched_transcript_count, missing_count, "Search aborted")
+            return
+
+
+def process_target(
+    conn: sqlite3.Connection,
+    search_params: SearchParams,
+    batch_size: int = 50,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+    is_cancelled: Callable[[], bool] | None = None,
+) -> None:
+    """Coordinate inserting transcript chunks from url in batches."""
+    url: str = (
+        _build_playlist_url(search_params.target_id)
+        if search_params.source_type == "Playlist"
+        else _build_channel_url(search_params.target_id)
+    )
+
+    metadata: list[VideoMetadata] = _get_records(url)
+    if not metadata:
+        if progress_callback is not None:
+            progress_callback(0, 0, f"{search_params.source_type} has no videos")
+        return
+
+    missing_metadata, total_count, skipped_count = _filter_metadata(
+        conn,
+        metadata,
+        search_params.start_date,
+        search_params.end_date,
+    )
+
+    if total_count == 0:
+        if progress_callback is not None:
+            progress_callback(100, 100, f"{search_params.source_type} has no videos within the specified dates")
+        return
+
+    if not missing_metadata:
+        if progress_callback is not None:
+            progress_callback(100, 100, "All videos are already processed")
+        return
+
+    _process_batches(
+        conn=conn,
+        missing_metadata=missing_metadata,
+        batch_size=batch_size,
+        skipped_count=skipped_count,
+        progress_callback=progress_callback,
+        is_cancelled=is_cancelled,
+    )

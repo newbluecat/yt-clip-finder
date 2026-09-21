@@ -5,9 +5,9 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
-  "pyside6>=6.11.1",
-  "youtube-transcript-api>=1.2.4",
-  "yt-dlp>=2026.7.4",
+    "pyside6>=6.11.1",
+    "youtube-transcript-api>=1.2.4",
+    "yt-dlp>=2026.7.4",
 ]
 
 [tool.ruff]

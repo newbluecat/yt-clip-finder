@@ -1,7 +1,7 @@
 import datetime
 import html
 import urllib.parse
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
 from PySide6.QtCore import QDate, Qt
 from PySide6.QtWidgets import (
@@ -22,7 +22,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from database import SearchResult
+from models import SearchParams
+
+if TYPE_CHECKING:
+    from database import SearchResult
+
 from search_worker import SearchWorker
 
 MAX_QUERY_LENGTH: Final[int] = 50
@@ -154,13 +158,21 @@ class MainWindow(QMainWindow):
         button_layout: QHBoxLayout = QHBoxLayout()
         button_layout.addStretch()
 
+        self.clear_button: QPushButton = QPushButton("Clear")
+        self.clear_button.clicked.connect(self.clear_results)
+
         self.abort_button: QPushButton = QPushButton("Abort")
         self.abort_button.setEnabled(False)
         self.abort_button.clicked.connect(self.on_abort_clicked)
 
         self.search_button: QPushButton = QPushButton("Search")
+        self.search_button.setEnabled(False)
         self.search_button.clicked.connect(self.on_search_clicked)
 
+        self.id_input.textChanged.connect(self._validate_inputs)
+        self.query_input.textChanged.connect(self._validate_inputs)
+
+        button_layout.addWidget(self.clear_button)
         button_layout.addWidget(self.abort_button)
         button_layout.addWidget(self.search_button)
         main_layout.addLayout(button_layout)
@@ -168,14 +180,20 @@ class MainWindow(QMainWindow):
     def on_source_changed(self, text: str) -> None:
         """Update the Target ID placeholder based on the selected source."""
         if text == "Playlist":
-            self.id_input.setPlaceholderText("Example: PLKDZ1ig0uz-U")
+            self.id_input.setPlaceholderText("ex. PLKDZ1ig0uz-U")
         else:
-            self.id_input.setPlaceholderText("Example: @YouTube")
+            self.id_input.setPlaceholderText("ex. @YouTube")
 
     def on_date_mode_toggled(self, checked: bool) -> None:
         """Enable or disable custom date pickers based on radio selection."""
         self.date_from.setEnabled(checked)
         self.date_to.setEnabled(checked)
+
+    def _validate_inputs(self, _: str = "") -> None:
+        """Dynamically enable search button only if fields have text."""
+        has_target: bool = bool(self.id_input.text().strip())
+        has_query: bool = bool(self.query_input.text().strip())
+        self.search_button.setEnabled(has_target and has_query)
 
     def on_search_clicked(self) -> None:
         """Trigger search state and start the background worker."""
@@ -183,33 +201,27 @@ class MainWindow(QMainWindow):
         target_id: str = self.id_input.text().strip()
         query: str = self.query_input.text().strip()
 
-        # we catch falsy strings here since an empty string or id is invalid for a search
-        if not target_id:
-            self.on_error("ERROR: Playlist ID cannot be empty.")
-            return
-
-        if not query:
-            self.on_error("ERROR: Query cannot be empty.")
-            return
-
         start_date: datetime.date | None = None
         end_date: datetime.date | None = None
 
         if self.date_custom_radio.isChecked():
-            # start_date = self.date_from.date().toPython()
-            # end_date = self.date_to.date().toPython()
-            q_start = self.date_from.date()
-            q_end = self.date_to.date()
+            q_start: QDate = self.date_from.date()
+            q_end: QDate = self.date_to.date()
             start_date = datetime.date(q_start.year(), q_start.month(), q_start.day())
             end_date = datetime.date(q_end.year(), q_end.month(), q_end.day())
 
-        self.worker: SearchWorker = SearchWorker(
-            db_path="transcripts.db",
+        search_params: SearchParams = SearchParams(
             source_type=source_type,
             target_id=target_id,
-            query_text=query,
+            query=query,
             start_date=start_date,
             end_date=end_date,
+            limit=100,
+        )
+
+        self.worker: SearchWorker = SearchWorker(
+            db_path="transcripts.db",
+            search=search_params,
             parent=self,
         )
 
@@ -229,7 +241,7 @@ class MainWindow(QMainWindow):
         """Handle worker completion and table population."""
         result_count: int = len(search_results)
 
-        self.search_button.setEnabled(True)
+        self._validate_inputs()
         self.abort_button.setEnabled(False)
         self.progress_bar.setStyleSheet("")
         self.progress_bar.setRange(0, 100)
@@ -240,15 +252,26 @@ class MainWindow(QMainWindow):
             return
 
         self.progress_bar.setFormat(f"Found {result_count} results!")
-        self.results_table.clearContents()
+        self.results_table.setRowCount(0)
         self.results_table.setRowCount(result_count)
 
         for row, sr in enumerate(search_results):
             self.results_table.setItem(row, 0, QTableWidgetItem(sr.title))
             self.results_table.setItem(row, 1, QTableWidgetItem(sr.channel))
 
-            minutes, seconds = divmod(sr.start_time, 60)
-            self.results_table.setItem(row, 2, QTableWidgetItem(f"{int(minutes):02d}:{int(seconds):02d}"))
+            hours: float
+            rem: float
+            hours, rem = divmod(sr.start_time, 3600)
+
+            minutes: float
+            seconds: float
+            minutes, seconds = divmod(rem, 60)
+            time_str: str = (
+                f"{int(hours)}:{int(minutes):02d}:{int(seconds):02d}"
+                if hours > 0
+                else f"{int(minutes):02d}:{int(seconds):02d}"
+            )
+            self.results_table.setItem(row, 2, QTableWidgetItem(time_str))
 
             safe_video_id: str = urllib.parse.quote(sr.video_id)
             youtube_url: str = f"https://youtu.be/{safe_video_id}?t={int(sr.start_time)}"
@@ -270,7 +293,7 @@ class MainWindow(QMainWindow):
 
     def on_error(self, err_msg: str) -> None:
         """Handle worker errors."""
-        self.search_button.setEnabled(True)
+        self._validate_inputs()
         self.abort_button.setEnabled(False)
         self.progress_bar.setStyleSheet(QPROGRESS_ERROR_STYLESHEET)
         self.progress_bar.setRange(0, 100)
@@ -287,12 +310,14 @@ class MainWindow(QMainWindow):
 
     def on_abort_clicked(self) -> None:
         """Trigger abort state in UI (mock handler)."""
-        self.search_button.setEnabled(True)
+        if getattr(self, "worker", None) is not None:
+            self.worker.cancel()
+        self._validate_inputs()
         self.abort_button.setEnabled(False)
         self.progress_bar.setStyleSheet("")
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(100)
-        self.progress_bar.setFormat("Search aborted.")
+        self.progress_bar.setFormat("Search aborted")
 
     def clear_results(self) -> None:
         """Clear all rows from the results table."""

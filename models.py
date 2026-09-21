@@ -33,6 +33,17 @@ class TranscriptSnippet(NamedTuple):
     text: str
 
 
+class SearchParams(NamedTuple):
+    """Encapsulates all parameters for a search operation."""
+
+    source_type: str
+    target_id: str
+    query: str
+    start_date: date | None
+    end_date: date | None
+    limit: int = 100
+
+
 class SearchResult(NamedTuple):
     """Results of a search of the sqlite3 database."""
 

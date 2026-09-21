@@ -1,11 +1,13 @@
-import sqlite3
 import sys
+from typing import TYPE_CHECKING
 
 from PySide6.QtWidgets import QApplication
 
-import downloader
 from main_window import MainWindow
 from models import SearchResult
+
+if TYPE_CHECKING:
+    import sqlite3
 
 
 def get_all_transcripts(
@@ -43,11 +45,6 @@ def get_all_transcripts(
 
 
 if __name__ == "__main__":
-    url: str = downloader._build_playlist_url(
-        "PLrMS357ieiqS894xcyXj2wwG8H05Rutvo",
-    )
-    # conn = sqlite3.Connection("transcripts.db")
-    # print(get_all_transcripts(conn))
     app: QApplication = QApplication(sys.argv)
     window: MainWindow = MainWindow()
     window.show()
